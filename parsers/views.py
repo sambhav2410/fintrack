@@ -15,17 +15,19 @@ from .sms_engine import parse_sms_batch, categorize_merchant
 from .pdf_engine import parse_pdf_statement, debug_extract_pdf_text
 
 
-GEMINI_PROMPT = """Extract ALL financial transactions from these pages of a bank/UPI statement PDF.
+GEMINI_PROMPT = """Extract ALL individual financial transactions from this bank/UPI statement text.
 
 Return ONLY a valid JSON array, no other text. Each object must have exactly:
 {"date":"YYYY-MM-DD","amount":123.45,"transaction_type":"debit","narration":"description","merchant_name":"name or empty","reference_number":"UPI ID or empty"}
 
 Rules:
-- debit = money OUT (Paid to, Sent to, purchase, withdrawal)
-- credit = money IN (Received from, salary, refund, cashback)
-- Extract EVERY transaction — do not skip any
-- Skip only page headers, column headers, balance summary lines
-- Return [] if no transactions on these pages"""
+- debit = money OUT (Paid to, Sent to, purchase, withdrawal, Dr)
+- credit = money IN (Received from, salary, refund, cashback, Cr)
+- Each transaction must have its own DATE — lines like "01Feb,2026 Paid to ARATI 2000" are individual transactions
+- SKIP: page headers, statement period summary (e.g. "Total Sent: 81420"), column headers
+- A summary line like "01February2026-28February2026 81,420.86 48,392.35" is NOT a transaction — skip it
+- Extract EVERY individual transaction line — do not skip any real transaction
+- Return [] if no transactions found"""
 
 
 def _call_gemini_on_file(client, tmp_path, bank_name, page_info=""):
@@ -107,13 +109,11 @@ def parse_with_gemini(pdf_bytes, bank_name):
             prompt = GEMINI_PROMPT + f"\n\nBank: {bank_name}\n\n" + text_chunk
             return _call_gemini_text_batch(client, prompt, bank_name, page_info)
 
-        # Single call if text is small enough (most PDFs under 30 pages)
-        if len(full_text) <= 50000:
-            print(f"[Gemini] Single call for all {total_pages} pages")
-            all_items = parse_text_chunk(full_text, f"all {total_pages} pages")
+        # Always use parallel batches of 3 pages — avoids Gemini response truncation
+        if False:
+            all_items = []  # never used
         else:
-            # Parallel batches of 10 pages for very large PDFs
-            batch_size = 10
+            batch_size = 3
             batches = []
             for batch_start in range(0, total_pages, batch_size):
                 batch_end = min(batch_start + batch_size, total_pages)
@@ -121,7 +121,7 @@ def parse_with_gemini(pdf_bytes, bank_name):
                 page_info = f"pages {batch_start+1}-{batch_end}"
                 batches.append((batch_text, page_info, batch_start))
 
-            print(f"[Gemini] {len(batches)} parallel batches for large PDF")
+            print(f"[Gemini] {len(batches)} parallel batches of {batch_size} pages each")
             batch_results = {}
             with ThreadPoolExecutor(max_workers=min(len(batches), 5)) as executor:
                 futures = {
