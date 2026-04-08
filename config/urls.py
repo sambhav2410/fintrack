@@ -16,8 +16,13 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path, include
+from django.http import JsonResponse
+
+def version(request):
+    return JsonResponse({"version": "gemini-v5", "model": "gemini-2.5-flash-lite"})
 
 urlpatterns = [
+    path("version/", version),
     path("admin/", admin.site.urls),
     path("api/auth/", include("accounts.urls")),
     path("api/transactions/", include("transactions.urls")),
