@@ -38,7 +38,7 @@ def _call_gemini_on_file(client, tmp_path, bank_name, page_info=""):
             config=types.UploadFileConfig(mime_type="application/pdf"),
         )
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-flash-lite",
             contents=[uploaded, GEMINI_PROMPT],
         )
         text = response.text.strip()
@@ -63,7 +63,7 @@ def _call_gemini_text_batch(client, prompt, bank_name, page_info):
     """Call Gemini with a text prompt and return parsed transaction list."""
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-flash-lite",
             contents=prompt,
         )
         text = response.text.strip()
@@ -217,7 +217,7 @@ def parse_sms_with_gemini(sms_list):
             prompt = SMS_GEMINI_PROMPT + sms_text
             try:
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-2.5-flash-lite",
                     contents=prompt,
                 )
                 text = response.text.strip()
