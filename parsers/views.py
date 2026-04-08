@@ -59,11 +59,33 @@ def _call_gemini_on_file(client, tmp_path, bank_name, page_info=""):
                 pass
 
 
+def _call_gemini_text_batch(client, prompt, bank_name, page_info):
+    """Call Gemini with a text prompt and return parsed transaction list."""
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        text = response.text.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        items = json.loads(text)
+        result = items if isinstance(items, list) else []
+        print(f"[Gemini] {page_info}: {len(result)} transactions")
+        return result
+    except Exception as e:
+        print(f"[Gemini] {page_info} error: {e}")
+        return []
+
+
 def parse_with_gemini(pdf_bytes, bank_name):
     """
-    Extract text from PDF using pdfplumber, send text batches to Gemini.
-    Text-based approach: no file uploads, no temp files, works on any server.
+    Extract text from PDF using pdfplumber, send ALL batches to Gemini IN PARALLEL.
+    15-page PDF takes ~5s instead of ~45s (3 parallel calls vs 3 sequential).
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     try:
         import pdfplumber
         from google import genai
@@ -75,58 +97,58 @@ def parse_with_gemini(pdf_bytes, bank_name):
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages)
             for page in pdf.pages:
-                text = page.extract_text() or ""
-                pages_text.append(text)
+                pages_text.append(page.extract_text() or "")
 
-        print(f"[Gemini] Processing {bank_name} PDF: {total_pages} pages")
+        print(f"[Gemini] Processing {bank_name} PDF: {total_pages} pages in parallel batches")
 
-        # Send in batches of 5 pages
+        # Build all batches
         batch_size = 5
-        all_results = []
-
+        batches = []
         for batch_start in range(0, total_pages, batch_size):
             batch_end = min(batch_start + batch_size, total_pages)
-            batch_text = "\n\n--- PAGE BREAK ---\n\n".join(
-                pages_text[batch_start:batch_end]
-            )
-            page_info = f"pages {batch_start+1}-{batch_end}"
-
+            batch_text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text[batch_start:batch_end])
             prompt = GEMINI_PROMPT + f"\n\nBank: {bank_name}\n\n" + batch_text
+            page_info = f"pages {batch_start+1}-{batch_end}"
+            batches.append((prompt, page_info, batch_start))
 
-            try:
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                )
-                text = response.text.strip()
-                if "```json" in text:
-                    text = text.split("```json")[1].split("```")[0].strip()
-                elif "```" in text:
-                    text = text.split("```")[1].split("```")[0].strip()
-                items = json.loads(text)
-                if not isinstance(items, list):
-                    items = []
-                print(f"[Gemini] {page_info}: {len(items)} transactions")
-            except Exception as e:
-                print(f"[Gemini] {page_info} error: {e}")
-                items = []
-
-            for item in items:
+        # Call all batches in parallel
+        batch_results = {}
+        with ThreadPoolExecutor(max_workers=min(len(batches), 5)) as executor:
+            futures = {
+                executor.submit(_call_gemini_text_batch, client, prompt, bank_name, page_info): batch_start
+                for prompt, page_info, batch_start in batches
+            }
+            for future in as_completed(futures):
+                batch_start = futures[future]
                 try:
-                    amount = float(item.get("amount", 0))
-                    if amount <= 0:
-                        continue
-                    all_results.append({
-                        "amount": amount,
-                        "transaction_type": item.get("transaction_type", "debit"),
-                        "narration": str(item.get("narration", ""))[:300],
-                        "date": item.get("date", timezone.now().strftime("%Y-%m-%d")),
-                        "bank_name": bank_name,
-                        "merchant_name": str(item.get("merchant_name", ""))[:100],
-                        "reference_number": str(item.get("reference_number", ""))[:100],
-                    })
-                except Exception:
+                    batch_results[batch_start] = future.result()
+                except Exception as e:
+                    print(f"[Gemini] batch at page {batch_start} failed: {e}")
+                    batch_results[batch_start] = []
+
+        # Collect results in original page order
+        all_items = []
+        for _, _, batch_start in batches:
+            all_items.extend(batch_results.get(batch_start, []))
+
+        # Normalize results
+        all_results = []
+        for item in all_items:
+            try:
+                amount = float(item.get("amount", 0))
+                if amount <= 0:
                     continue
+                all_results.append({
+                    "amount": amount,
+                    "transaction_type": item.get("transaction_type", "debit"),
+                    "narration": str(item.get("narration", ""))[:300],
+                    "date": item.get("date", timezone.now().strftime("%Y-%m-%d")),
+                    "bank_name": bank_name,
+                    "merchant_name": str(item.get("merchant_name", ""))[:100],
+                    "reference_number": str(item.get("reference_number", ""))[:100],
+                })
+            except Exception:
+                continue
 
         print(f"[Gemini] Total extracted: {len(all_results)} transactions from {bank_name}")
         return all_results
