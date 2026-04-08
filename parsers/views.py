@@ -61,43 +61,55 @@ def _call_gemini_on_file(client, tmp_path, bank_name, page_info=""):
 
 def parse_with_gemini(pdf_bytes, bank_name):
     """
-    Split PDF into batches of 5 pages, send each to Gemini separately.
-    Combines all results. Fast and avoids timeout on large PDFs.
+    Extract text from PDF using pdfplumber, send text batches to Gemini.
+    Text-based approach: no file uploads, no temp files, works on any server.
     """
-    import tempfile, os
     try:
-        import pikepdf
+        import pdfplumber
         from google import genai
 
         client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
-        # Split PDF into 5-page chunks using pikepdf
-        src = pikepdf.open(io.BytesIO(pdf_bytes))
-        total_pages = len(src.pages)
+        # Extract text from all pages
+        pages_text = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            total_pages = len(pdf.pages)
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                pages_text.append(text)
+
+        print(f"[Gemini] Processing {bank_name} PDF: {total_pages} pages")
+
+        # Send in batches of 5 pages
         batch_size = 5
-        chunks = []
-        for start in range(0, total_pages, batch_size):
-            end = min(start + batch_size, total_pages)
-            dst = pikepdf.Pdf.new()
-            for i in range(start, end):
-                dst.pages.append(src.pages[i])
-            buf = io.BytesIO()
-            dst.save(buf)
-            chunks.append((start + 1, end, buf.getvalue()))
-        src.close()
-
-        print(f"[Gemini] Processing {bank_name} PDF: {total_pages} pages in {len(chunks)} batches")
-
         all_results = []
-        for page_from, page_to, chunk_bytes in chunks:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(chunk_bytes)
-                tmp_path = tmp.name
+
+        for batch_start in range(0, total_pages, batch_size):
+            batch_end = min(batch_start + batch_size, total_pages)
+            batch_text = "\n\n--- PAGE BREAK ---\n\n".join(
+                pages_text[batch_start:batch_end]
+            )
+            page_info = f"pages {batch_start+1}-{batch_end}"
+
+            prompt = GEMINI_PROMPT + f"\n\nBank: {bank_name}\n\n" + batch_text
+
             try:
-                items = _call_gemini_on_file(client, tmp_path, bank_name, f"pages {page_from}-{page_to}")
-                print(f"[Gemini] pages {page_from}-{page_to}: {len(items)} transactions")
-            finally:
-                os.unlink(tmp_path)
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                )
+                text = response.text.strip()
+                if "```json" in text:
+                    text = text.split("```json")[1].split("```")[0].strip()
+                elif "```" in text:
+                    text = text.split("```")[1].split("```")[0].strip()
+                items = json.loads(text)
+                if not isinstance(items, list):
+                    items = []
+                print(f"[Gemini] {page_info}: {len(items)} transactions")
+            except Exception as e:
+                print(f"[Gemini] {page_info} error: {e}")
+                items = []
 
             for item in items:
                 try:
