@@ -82,8 +82,9 @@ def _call_gemini_text_batch(client, prompt, bank_name, page_info):
 
 def parse_with_gemini(pdf_bytes, bank_name):
     """
-    Extract text from PDF using pdfplumber, send ALL batches to Gemini IN PARALLEL.
-    15-page PDF takes ~5s instead of ~45s (3 parallel calls vs 3 sequential).
+    Extract all text from PDF with pdfplumber, then send to Gemini.
+    - Under 8000 chars: single call (fastest)
+    - Over 8000 chars: parallel batches of 10 pages
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     try:
@@ -92,46 +93,54 @@ def parse_with_gemini(pdf_bytes, bank_name):
 
         client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
-        # Extract text from all pages
+        # Extract all text at once
         pages_text = []
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages)
             for page in pdf.pages:
                 pages_text.append(page.extract_text() or "")
 
-        print(f"[Gemini] Processing {bank_name} PDF: {total_pages} pages in parallel batches")
+        full_text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text)
+        print(f"[Gemini] {bank_name}: {total_pages} pages, {len(full_text)} chars")
 
-        # Build all batches
-        batch_size = 5
-        batches = []
-        for batch_start in range(0, total_pages, batch_size):
-            batch_end = min(batch_start + batch_size, total_pages)
-            batch_text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text[batch_start:batch_end])
-            prompt = GEMINI_PROMPT + f"\n\nBank: {bank_name}\n\n" + batch_text
-            page_info = f"pages {batch_start+1}-{batch_end}"
-            batches.append((prompt, page_info, batch_start))
+        def parse_text_chunk(text_chunk, page_info):
+            prompt = GEMINI_PROMPT + f"\n\nBank: {bank_name}\n\n" + text_chunk
+            return _call_gemini_text_batch(client, prompt, bank_name, page_info)
 
-        # Call all batches in parallel
-        batch_results = {}
-        with ThreadPoolExecutor(max_workers=min(len(batches), 5)) as executor:
-            futures = {
-                executor.submit(_call_gemini_text_batch, client, prompt, bank_name, page_info): batch_start
-                for prompt, page_info, batch_start in batches
-            }
-            for future in as_completed(futures):
-                batch_start = futures[future]
-                try:
-                    batch_results[batch_start] = future.result()
-                except Exception as e:
-                    print(f"[Gemini] batch at page {batch_start} failed: {e}")
-                    batch_results[batch_start] = []
+        # Single call if text is small enough (most PDFs under 30 pages)
+        if len(full_text) <= 50000:
+            print(f"[Gemini] Single call for all {total_pages} pages")
+            all_items = parse_text_chunk(full_text, f"all {total_pages} pages")
+        else:
+            # Parallel batches of 10 pages for very large PDFs
+            batch_size = 10
+            batches = []
+            for batch_start in range(0, total_pages, batch_size):
+                batch_end = min(batch_start + batch_size, total_pages)
+                batch_text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text[batch_start:batch_end])
+                page_info = f"pages {batch_start+1}-{batch_end}"
+                batches.append((batch_text, page_info, batch_start))
 
-        # Collect results in original page order
-        all_items = []
-        for _, _, batch_start in batches:
-            all_items.extend(batch_results.get(batch_start, []))
+            print(f"[Gemini] {len(batches)} parallel batches for large PDF")
+            batch_results = {}
+            with ThreadPoolExecutor(max_workers=min(len(batches), 5)) as executor:
+                futures = {
+                    executor.submit(parse_text_chunk, text, page_info): batch_start
+                    for text, page_info, batch_start in batches
+                }
+                for future in as_completed(futures):
+                    batch_start = futures[future]
+                    try:
+                        batch_results[batch_start] = future.result()
+                    except Exception as e:
+                        print(f"[Gemini] batch {batch_start} failed: {e}")
+                        batch_results[batch_start] = []
 
-        # Normalize results
+            all_items = []
+            for _, _, batch_start in batches:
+                all_items.extend(batch_results.get(batch_start, []))
+
+        # Normalize
         all_results = []
         for item in all_items:
             try:
@@ -175,6 +184,61 @@ def build_dedup_key(txn_dict, user_id):
     return f"{user_id}:{txn_dict['amount']}:{txn_dict['date'][:10]}:{txn_dict.get('account_last4','')}"
 
 
+SMS_GEMINI_PROMPT = """You are a bank SMS parser. Extract financial transactions from the SMS messages below.
+
+Return ONLY a valid JSON array, no other text. Each object must have exactly these fields:
+{"date":"YYYY-MM-DD","amount":123.45,"transaction_type":"debit","narration":"full sms body","merchant_name":"merchant or empty string","reference_number":"UPI ref/txn ID or empty string","bank_name":"bank name or empty string","account_last4":"last 4 digits or empty string"}
+
+Rules:
+- debit = money OUT (debited, paid, sent, purchase, withdrawn, dr)
+- credit = money IN (credited, received, salary, refund, cashback, cr)
+- amount must be positive number only
+- Skip OTP, promotional, balance alerts with no transaction
+- Return [] if no transactions found
+
+SMS messages:
+"""
+
+
+def parse_sms_with_gemini(sms_list):
+    """Use Gemini to parse SMS list. Falls back to regex on error."""
+    try:
+        from google import genai
+        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+        all_results = []
+        batch_size = 50
+        for i in range(0, len(sms_list), batch_size):
+            batch = sms_list[i:i + batch_size]
+            sms_text = "\n\n".join([
+                f"[{idx+1}] From: {s.get('sender','')}\n{s.get('body','')}"
+                for idx, s in enumerate(batch)
+            ])
+            prompt = SMS_GEMINI_PROMPT + sms_text
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                )
+                text = response.text.strip()
+                if "```json" in text:
+                    text = text.split("```json")[1].split("```")[0].strip()
+                elif "```" in text:
+                    text = text.split("```")[1].split("```")[0].strip()
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    all_results.extend(parsed)
+                    print(f"[SMS Gemini] batch {i//batch_size+1}: {len(parsed)} transactions")
+            except Exception as e:
+                print(f"[SMS Gemini] batch error: {e}, using regex fallback")
+                all_results.extend(parse_sms_batch(batch))
+
+        return all_results
+    except Exception as e:
+        print(f"[SMS Gemini] Fatal: {e}, using regex fallback")
+        return parse_sms_batch(sms_list)
+
+
 class SMSParseView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [JSONParser]
@@ -186,32 +250,38 @@ class SMSParseView(APIView):
         if len(sms_list) > 500:
             return Response({"error": "Max 500 SMS per request"}, status=400)
 
-        parsed = parse_sms_batch(sms_list)
+        # Use Gemini if available, else regex
+        if settings.GEMINI_API_KEY:
+            parsed = parse_sms_with_gemini(sms_list)
+        else:
+            parsed = parse_sms_batch(sms_list)
+
         imported = 0
         duplicates = 0
         errors = 0
 
         for txn_data in parsed:
             try:
-                dedup_key = build_dedup_key(txn_data, request.user.id)
-                ref = txn_data.get("reference_number", "")
+                amount = float(txn_data.get("amount", 0))
+                if amount <= 0:
+                    continue
 
-                # Check duplicate by reference number
+                ref = str(txn_data.get("reference_number", ""))
+
                 if ref and Transaction.objects.filter(
                     user=request.user, reference_number=ref
                 ).exists():
                     duplicates += 1
                     continue
 
-                # Check duplicate by amount+date+account
                 try:
-                    txn_date = dateparser.parse(txn_data["date"])
+                    txn_date = dateparser.parse(str(txn_data.get("date", "")))
                 except Exception:
                     txn_date = timezone.now()
 
                 if Transaction.objects.filter(
                     user=request.user,
-                    amount=txn_data["amount"],
+                    amount=amount,
                     date__date=txn_date.date() if txn_date else None,
                     account_last4=txn_data.get("account_last4", ""),
                     bank_name=txn_data.get("bank_name", ""),
@@ -219,21 +289,25 @@ class SMSParseView(APIView):
                     duplicates += 1
                     continue
 
-                category = get_or_create_category(txn_data.get("category_name", "Other"))
+                category_name = categorize_merchant(
+                    txn_data.get("merchant_name", ""),
+                    txn_data.get("narration", ""),
+                )
+                category = get_or_create_category(category_name)
 
                 Transaction.objects.create(
                     user=request.user,
-                    amount=txn_data["amount"],
-                    transaction_type=txn_data["transaction_type"],
+                    amount=amount,
+                    transaction_type=txn_data.get("transaction_type", "debit"),
                     category=category,
                     date=txn_date or timezone.now(),
-                    narration=txn_data.get("narration", ""),
-                    merchant_name=txn_data.get("merchant_name", ""),
-                    reference_number=ref,
-                    account_last4=txn_data.get("account_last4", ""),
-                    bank_name=txn_data.get("bank_name", ""),
+                    narration=str(txn_data.get("narration", ""))[:500],
+                    merchant_name=str(txn_data.get("merchant_name", ""))[:100],
+                    reference_number=ref[:100],
+                    account_last4=str(txn_data.get("account_last4", ""))[:4],
+                    bank_name=str(txn_data.get("bank_name", ""))[:100],
                     source=Transaction.SOURCE_SMS,
-                    raw_text=txn_data.get("raw_text", ""),
+                    raw_text=str(txn_data.get("narration", ""))[:1000],
                 )
                 imported += 1
             except Exception as e:
