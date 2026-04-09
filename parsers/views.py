@@ -276,6 +276,9 @@ class SMSParseView(APIView):
 
                 try:
                     txn_date = dateparser.parse(str(txn_data.get("date", "")))
+                    if txn_date and txn_date.tzinfo is None:
+                        import pytz
+                        txn_date = pytz.timezone("Asia/Kolkata").localize(txn_date)
                 except Exception:
                     txn_date = timezone.now()
 
