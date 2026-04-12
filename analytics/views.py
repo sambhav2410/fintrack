@@ -3,8 +3,10 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
+from django.conf import settings
 from datetime import datetime, date
 import calendar
+import json
 
 from transactions.models import Transaction, Category
 
@@ -224,3 +226,90 @@ class CategoryBreakdownView(APIView):
             })
 
         return Response({"categories": result, "total_spent": round(total_spent, 2)})
+
+
+class FinBotChatView(APIView):
+    """Gemini-powered FinBot: answers questions using the user's real transaction data."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        question = (request.data.get("question") or "").strip()
+        if not question:
+            return Response({"error": "question required"}, status=400)
+
+        # Build financial context from last 90 days of transactions
+        today = timezone.now().date()
+        start_90 = today.replace(day=1)  # current month start
+        # Get last 3 months
+        months_data = []
+        for i in range(3):
+            m = today.month - i
+            y = today.year
+            while m <= 0:
+                m += 12
+                y -= 1
+            s = date(y, m, 1)
+            e = date(y, m, calendar.monthrange(y, m)[1])
+            txns = Transaction.objects.filter(
+                user=request.user, date__date__gte=s, date__date__lte=e
+            )
+            spent = txns.filter(transaction_type="debit").aggregate(t=Sum("amount"))["t"] or 0
+            income = txns.filter(transaction_type="credit").aggregate(t=Sum("amount"))["t"] or 0
+            # Category breakdown
+            cats = txns.filter(transaction_type="debit").values("category__name").annotate(
+                total=Sum("amount"), cnt=Count("id")
+            ).order_by("-total")[:8]
+            months_data.append({
+                "month": f"{y}-{m:02d}",
+                "spent": float(spent),
+                "income": float(income),
+                "savings": float(income) - float(spent),
+                "categories": [
+                    {"name": c["category__name"] or "Other", "amount": float(c["total"] or 0), "count": c["cnt"]}
+                    for c in cats
+                ],
+            })
+
+        # Recent individual transactions (last 30)
+        recent_txns = Transaction.objects.filter(
+            user=request.user
+        ).select_related("category").order_by("-date")[:30]
+        txn_lines = []
+        for t in recent_txns:
+            txn_lines.append(
+                f"{t.date.strftime('%d %b %Y')} | {'OUT' if t.transaction_type=='debit' else 'IN'} | "
+                f"₹{float(t.amount):.0f} | {t.merchant_name or t.narration[:40] or 'Unknown'} | "
+                f"{t.category.name if t.category else 'Other'}"
+            )
+
+        context = f"""You are FinBot, a personal finance AI for an Indian user.
+
+USER'S FINANCIAL DATA:
+
+Monthly Summary (last 3 months):
+{json.dumps(months_data, indent=2)}
+
+Recent Transactions (last 30):
+{chr(10).join(txn_lines) if txn_lines else 'No transactions found.'}
+
+INSTRUCTIONS:
+- Answer in 2-4 short paragraphs max. Be specific with rupee amounts from the data.
+- Give actionable advice based on their actual spending patterns.
+- Use Indian context (₹, UPI, SIP, FD etc.)
+- If asked where they spend most, name the actual top categories with amounts.
+- If no data available, tell them to import transactions first.
+- Do NOT make up numbers not in the data.
+- Keep response concise and friendly."""
+
+        try:
+            import google.genai as genai
+            client = genai.Client(api_key=settings.GEMINI_API_KEY)
+            resp = client.models.generate_content(
+                model="gemini-2.0-flash-lite",
+                contents=f"{context}\n\nUSER QUESTION: {question}",
+            )
+            answer = resp.text.strip()
+        except Exception as e:
+            answer = f"Sorry, I couldn't process your question right now. Please try again. (Error: {str(e)[:100]})"
+
+        return Response({"answer": answer})

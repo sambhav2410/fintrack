@@ -11,3 +11,6 @@ class BudgetSerializer(serializers.ModelSerializer):
         model = Budget
         fields = ["id", "category", "category_name", "category_color", "monthly_limit", "month"]
         read_only_fields = ["id"]
+        extra_kwargs = {
+            "month": {"required": False},
+        }
