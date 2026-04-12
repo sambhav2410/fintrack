@@ -1,6 +1,6 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import generics
+from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum
 from django.utils import timezone
@@ -25,9 +25,21 @@ class BudgetListCreateView(generics.ListCreateAPIView):
         month = self.request.query_params.get("month", current_month())
         return Budget.objects.filter(user=self.request.user, month=month).select_related("category")
 
-    def perform_create(self, serializer):
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         month = serializer.validated_data.get("month", current_month())
-        serializer.save(user=self.request.user, month=month)
+        category = serializer.validated_data["category"]
+        monthly_limit = serializer.validated_data["monthly_limit"]
+        # Upsert: update if same category+month already exists
+        budget, _ = Budget.objects.update_or_create(
+            user=request.user,
+            category=category,
+            month=month,
+            defaults={"monthly_limit": monthly_limit},
+        )
+        out = BudgetSerializer(budget)
+        return Response(out.data, status=status.HTTP_200_OK)
 
 
 class BudgetStatusView(APIView):
