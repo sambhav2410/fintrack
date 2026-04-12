@@ -1,4 +1,4 @@
-import random
+import secrets
 import string
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
@@ -54,7 +54,7 @@ class OTPToken(models.Model):
     @classmethod
     def generate_otp(cls, phone_number):
         cls.objects.filter(phone_number=phone_number, is_used=False).update(is_used=True)
-        otp = "".join(random.choices(string.digits, k=6))
+        otp = "".join(secrets.choice(string.digits) for _ in range(6))
         expiry = timezone.now() + timedelta(minutes=getattr(settings, "OTP_EXPIRY_MINUTES", 10))
         return cls.objects.create(
             phone_number=phone_number,

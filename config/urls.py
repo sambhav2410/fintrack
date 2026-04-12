@@ -17,29 +17,12 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-import json, logging
-
-logger = logging.getLogger(__name__)
 
 def version(request):
     return JsonResponse({"version": "gemini-v6", "model": "gemini-2.5-flash-lite"})
 
-@csrf_exempt
-def debug_log(request):
-    if request.method == "POST":
-        try:
-            data = json.loads(request.body)
-            msg = data.get("message", "")
-            print(f"[AndroidLog] {msg}")
-            logger.info(f"[AndroidLog] {msg}")
-        except Exception:
-            pass
-    return JsonResponse({"ok": True})
-
 urlpatterns = [
     path("version/", version),
-    path("debug/log/", debug_log),
     path("admin/", admin.site.urls),
     path("api/auth/", include("accounts.urls")),
     path("api/transactions/", include("transactions.urls")),

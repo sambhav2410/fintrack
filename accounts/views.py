@@ -1,3 +1,4 @@
+import secrets
 import requests
 from django.conf import settings
 from rest_framework.views import APIView
@@ -43,8 +44,7 @@ class SendOTPView(APIView):
         sent = send_otp_via_communication_service(phone_number, otp_token.otp_code)
 
         if not sent:
-            # For beta: log the OTP if SMS fails (remove in production)
-            print(f"[BETA OTP] {phone_number}: {otp_token.otp_code}")
+            pass  # OTP delivery failure — silent in production
 
         return Response(
             {"message": "OTP sent successfully", "phone_number": phone_number},
@@ -62,21 +62,6 @@ class VerifyOTPView(APIView):
 
         phone_number = serializer.validated_data["phone_number"]
         otp_code = serializer.validated_data["otp_code"]
-
-        # Master OTP for testing
-        MASTER_OTP = "119191"
-        if otp_code == MASTER_OTP:
-            user, created = User.objects.get_or_create(phone_number=phone_number)
-            refresh = RefreshToken.for_user(user)
-            return Response(
-                {
-                    "access": str(refresh.access_token),
-                    "refresh": str(refresh),
-                    "user": UserSerializer(user).data,
-                    "is_new_user": created,
-                },
-                status=status.HTTP_200_OK,
-            )
 
         try:
             otp_token = OTPToken.objects.filter(
