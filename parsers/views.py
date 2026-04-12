@@ -266,11 +266,13 @@ class SMSParseView(APIView):
                 if amount <= 0:
                     continue
 
-                ref = str(txn_data.get("reference_number", ""))
+                ref = str(txn_data.get("reference_number", "")).strip()
 
+                # Dedup by reference number (most reliable)
                 if ref and Transaction.objects.filter(
                     user=request.user, reference_number=ref
                 ).exists():
+                    print(f"[SMS dedup] skipped by ref={ref}")
                     duplicates += 1
                     continue
 
@@ -282,13 +284,19 @@ class SMSParseView(APIView):
                 except Exception:
                     txn_date = timezone.now()
 
-                if Transaction.objects.filter(
+                # Fuzzy dedup only when we have enough identifying info
+                account_last4 = str(txn_data.get("account_last4", "")).strip()
+                bank_name = str(txn_data.get("bank_name", "")).strip()
+                narration = str(txn_data.get("narration", "")).strip()
+
+                if account_last4 and bank_name and Transaction.objects.filter(
                     user=request.user,
                     amount=amount,
                     date__date=txn_date.date() if txn_date else None,
-                    account_last4=txn_data.get("account_last4", ""),
-                    bank_name=txn_data.get("bank_name", ""),
+                    account_last4=account_last4,
+                    bank_name=bank_name,
                 ).exists():
+                    print(f"[SMS dedup] skipped by amount+date+account: {amount} {account_last4} {bank_name}")
                     duplicates += 1
                     continue
 
