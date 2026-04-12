@@ -1,6 +1,9 @@
 import secrets
+import logging
 import requests
 from django.conf import settings
+
+logger = logging.getLogger(__name__)
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -44,7 +47,13 @@ class SendOTPView(APIView):
         sent = send_otp_via_communication_service(phone_number, otp_token.otp_code)
 
         if not sent:
-            pass  # OTP delivery failure — silent in production
+            # Log OTP to Railway logs if SHOW_OTP_IN_LOGS=true env var is set
+            # Remove this env var before public launch
+            import os
+            if os.getenv("SHOW_OTP_IN_LOGS") == "true":
+                logger.warning(f"[OTP] {phone_number}: {otp_token.otp_code}")
+            else:
+                logger.warning(f"[OTP] SMS delivery failed for {phone_number}")
 
         return Response(
             {"message": "OTP sent successfully", "phone_number": phone_number},
