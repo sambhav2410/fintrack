@@ -237,9 +237,8 @@ class FinBotChatView(APIView):
         if not question:
             return Response({"error": "question required"}, status=400)
 
-        # Build financial context from last 90 days of transactions
+        # Build financial context from last 3 months of transactions
         today = timezone.now().date()
-        start_90 = today.replace(day=1)  # current month start
         # Get last 3 months
         months_data = []
         for i in range(3):
@@ -305,7 +304,7 @@ INSTRUCTIONS:
             import google.genai as genai
             client = genai.Client(api_key=settings.GEMINI_API_KEY)
             resp = client.models.generate_content(
-                model="gemini-2.0-flash-lite",
+                model="gemini-2.5-flash-lite",
                 contents=f"{context}\n\nUSER QUESTION: {question}",
             )
             answer = resp.text.strip()
