@@ -289,14 +289,15 @@ class SMSParseView(APIView):
                 bank_name = str(txn_data.get("bank_name", "")).strip()
                 narration = str(txn_data.get("narration", "")).strip()
 
-                if account_last4 and bank_name and Transaction.objects.filter(
+                if account_last4 and bank_name and ref and Transaction.objects.filter(
                     user=request.user,
                     amount=amount,
                     date__date=txn_date.date() if txn_date else None,
                     account_last4=account_last4,
                     bank_name=bank_name,
+                    reference_number=ref,
                 ).exists():
-                    print(f"[SMS dedup] skipped by amount+date+account: {amount} {account_last4} {bank_name}")
+                    print(f"[SMS dedup] skipped by amount+date+account+ref: {amount} {account_last4} {bank_name} {ref}")
                     duplicates += 1
                     continue
 
